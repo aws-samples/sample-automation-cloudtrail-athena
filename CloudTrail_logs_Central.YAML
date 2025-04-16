@@ -1,0 +1,824 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: '**WARNING** This template creates AWS Lambda functions and related resources. You will be billed for the AWS resources used if you create a stack from this template. This template deploys a solution to automate partitioning of AWS CloudTrail logs for optimal querying. The solution consists of 2 AWS Lambda functions with permissions to read the Amazon S3 bucket where CloudTrail logs are stored, run Amazon Athena queries, and save results to the S3 bucket used by Athena.'
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: The name of the S3 bucket to read and list objects. Just the name, Example, "aws-controltower-logs-account-us-east-1". Make sure there are no spaces or other characters.
+  Prefix:
+    Type: String
+    Description: The prefix in your CloudTrail S3 bucket where CloudTrail logs can be found. For example, a typical path for a standalone trail would look like "AWSLogs/". A typical path for an organizational trail would look like "ORG_ID/AWSLogs/ORG_ID".
+  AthenaResultsBucketName:
+    Type: String
+    Description: The bucket where Athena query results are stored. For example, "aws-athena-query-results-account-us-east-1". Make sure there are no spaces or other characters.
+  AthenaDatabase:
+    Type: String
+    Description: The name of the Athena Database to hold the logs tables. This database will be created by this template.
+    Default: ct-central
+
+Resources:
+  LambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: LambdaTriggerRule
+      Description: "Triggers when specific Lambda functions are created"
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventName:
+            - CreateFunction20150331
+          responseElements:
+            functionName:
+              - CloudTrailLogsPartitionedAllAccounts
+              - CloudTrailLogsPartitionedByAccount
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CloudTrailLogsPartitionedByAccount'
+          Id: "Target1"
+          RetryPolicy:
+            MaximumRetryAttempts: 55
+        - Arn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:CloudTrailLogsPartitionedAllAccounts'
+          Id: "Target2"
+          RetryPolicy:
+            MaximumRetryAttempts: 55
+
+  AllAccountsLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: /aws/lambda/CloudTrailLogsPartitionedAllAccounts
+
+  ByAccountsLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      LogGroupName: /aws/lambda/CloudTrailLogsPartitionedByAccount
+
+  CloudTrailGlueDatabase:
+      Type: AWS::Glue::Database
+      Properties:
+        CatalogId:
+          Ref: AWS::AccountId
+        DatabaseInput:
+          Name: !Ref AthenaDatabase
+
+  SharedLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Shared permissions for Lambda functions for CloudTrail query solution
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:ListBucket'
+              - 's3:GetObject'
+              - 's3:GetBucketLocation'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${BucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${AthenaResultsBucketName}/*'
+          - Effect: Allow
+            Action:
+              - 'kms:GenerateDataKey'
+            Resource:
+              !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+          - Effect: Allow
+            Action:
+              - 'glue:GetDatabase'
+              - 'glue:UpdateDatabase'
+              - 'glue:GetTable'
+              - 'glue:UpdateTable'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${CloudTrailGlueDatabase}'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${CloudTrailGlueDatabase}/*'
+          - Effect: Allow
+            Action:
+              - 'glue:GetDatabase'
+              - 'glue:CreateDatabase'
+              - 'glue:GetDatabases'
+              - 'glue:GetTables'
+              - 'glue:GetTable'
+              - 'glue:GetPartitions'
+              - 'glue:CreateTable'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${CloudTrailGlueDatabase}'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${CloudTrailGlueDatabase}/*'
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*'
+
+  LambdaRoleByAccount:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref SharedLambdaPolicy
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CloudTrailLogsPartitionedByAccount:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  LambdaRoleAllAccounts:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref SharedLambdaPolicy
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CloudTrailLogsPartitionedAllAccounts:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+
+  LambdaFunctionPartitionByAccount:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaTriggerRule  
+    Properties:
+      FunctionName: CloudTrailLogsPartitionedByAccount
+      Runtime: python3.9
+      Role: !GetAtt LambdaRoleByAccount.Arn
+      Handler: index.lambda_handler
+      Timeout: 420 # 7 minutes
+      MemorySize: 3008 # High memory allocation
+      LoggingConfig:
+        LogGroup: !Ref ByAccountsLambdaLogGroup
+      Environment:
+        Variables:
+          BucketName: !Ref BucketName
+          AthenaResultsBucketName: !Ref AthenaResultsBucketName
+          AthenaDatabase: !Ref CloudTrailGlueDatabase
+          Prefix: !Ref Prefix
+          DataCatalog: !Ref AWS::AccountId
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import re
+          import time
+
+          # Create a boto3 session
+          session = boto3.Session()
+
+          # Get the current region from the session
+          current_region = session.region_name
+
+          # Create an S3 client
+          s3 = boto3.client('s3')
+          athena_client = boto3.client('athena', region_name=current_region)
+          glue_client = boto3.client('glue')
+
+          # Validation patterns
+          BUCKET_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+          PREFIX_PATTERN = re.compile(r'^[\w\-\./]+$')
+          DATABASE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+          def validate_input(input_str: str, pattern: re.Pattern, max_length: int = 255) -> bool:
+              """Validate input string against pattern and length."""
+              if not isinstance(input_str, str):
+                  return False
+              if len(input_str) > max_length:
+                  return False
+              return bool(pattern.match(input_str))
+
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = os.environ['BucketName']
+                  athena_results_bucket_name = os.environ['AthenaResultsBucketName']
+                  database = os.environ['AthenaDatabase']
+                  prefix = os.environ['Prefix'].lstrip('/')
+                  data_catalog = os.environ['DataCatalog']
+
+                  # Validate inputs
+                  if not all([
+                      validate_input(bucket_name, BUCKET_NAME_PATTERN),
+                      validate_input(athena_results_bucket_name, BUCKET_NAME_PATTERN),
+                      validate_input(database, DATABASE_NAME_PATTERN),
+                      validate_input(prefix, PREFIX_PATTERN)
+                  ]):
+                      raise ValueError("Invalid input parameters")
+
+                  # Finding if there are tables created already.
+                  athena_accounts = list_athena_tables_and_extract_accounts(data_catalog, database)
+                  # Finding accounts with logs in S3.
+                  accounts_ids = getting_accounts(bucket_name, prefix)
+
+                  # compare_account_lists(athena_accounts, accounts_ids)
+                  new_accounts = compare_account_lists(athena_accounts, accounts_ids)
+
+                  if new_accounts:
+                      run_athena(new_accounts, bucket_name, prefix, athena_results_bucket_name, database)
+                      print("New accounts found, running Athena queries")
+                  else:
+                      print("No new accounts found, skipping Athena queries")
+
+                  return print('Completed')
+              
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  raise
+
+
+
+          def compare_account_lists(athena_accounts, accounts_ids):
+              athena_set = set(athena_accounts)
+              s3_set = set(accounts_ids)
+
+              formatted_new_accounts = s3_set - athena_set
+              # Format the new accounts as a string representation of a list
+
+              if formatted_new_accounts:
+                  return formatted_new_accounts
+              else:
+                  return False
+
+
+          def list_athena_tables_and_extract_accounts(data_catalog, database):
+              # List tables in the specified database
+              tables = []
+              paginator = glue_client.get_paginator('get_tables')
+
+              # Pattern for trail_ followed by exactly 12 digits
+              pattern = 'trail_[0-9]{12}'
+
+              try:
+                  page_iterator = paginator.paginate(
+                      DatabaseName=database,
+                      CatalogId=data_catalog,
+                      Expression=pattern
+                  )
+
+                  for page in page_iterator:
+                      tables.extend(page['TableList'])
+
+              except Exception as e:
+                  print(f"Error getting tables: {str(e)}")
+                  raise
+
+              # Extract account IDs from table names
+              account_ids = []
+              for table in tables:
+                  table_name = table['Name']
+                  if table_name.startswith('trail_'):
+                      account_id = table_name.split('_')[1]
+                      if account_id.isdigit() and len(account_id) == 12:  # Ensure it's a valid AWS account ID
+                          account_ids.append(account_id)
+
+              # Remove duplicates and sort
+              athena_account_ids = sorted(list(set(account_ids)))
+
+              return athena_account_ids
+
+
+          def getting_accounts(bucket_name, prefix):
+
+              # List objects in the bucket with the given prefix
+              response_accounts = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter='/')
+
+              # Extract account IDs from the object keys
+              account_ids = set()
+              for obj in response_accounts.get('CommonPrefixes', []):
+                  match = re.match(r'^{}(\d+)/'.format(prefix), obj['Prefix'])
+                  if match:
+                      account_ids.add(match.group(1))
+
+              return account_ids
+
+
+          def run_athena(accounts_ids, bucket_name, prefix, athena_results_bucket_name, database):
+              for account_id in accounts_ids:
+                  # Specify the prefix (folder path) to list
+                  region = '''{region}'''
+                  date = '''{date}'''
+                  query_string = f"""
+                        CREATE EXTERNAL TABLE trail_{account_id} (
+                            eventVersion STRING,
+                            userIdentity STRUCT<
+                                type: STRING,
+                                principalId: STRING,
+                                arn: STRING,
+                                accountId: STRING,
+                                invokedBy: STRING,
+                                accessKeyId: STRING,
+                                userName: STRING,
+                                sessionContext: STRUCT<
+                                    attributes: STRUCT<
+                                        mfaAuthenticated: STRING,
+                                        creationDate: STRING>,
+                                    sessionIssuer: STRUCT<
+                                        type: STRING,
+                                        principalId: STRING,
+                                        arn: STRING,
+                                        accountId: STRING,
+                                        username: STRING>,
+                                    ec2RoleDelivery: STRING,
+                                    webIdFederationData: MAP<STRING,STRING>>>,
+                            eventTime STRING,
+                            eventSource STRING,
+                            eventName STRING,
+                            awsRegion STRING,
+                            sourceIpAddress STRING,
+                            userAgent STRING,
+                            errorCode STRING,
+                            errorMessage STRING,
+                            requestParameters STRING,
+                            responseElements STRING,
+                            additionalEventData STRING,
+                            requestId STRING,
+                            eventId STRING,
+                            resources ARRAY<STRUCT<
+                                arn: STRING,
+                                accountId: STRING,
+                                type: STRING>>,
+                            eventType STRING,
+                            apiVersion STRING,
+                            readOnly STRING,
+                            recipientAccountId STRING,
+                            serviceEventDetails STRING,
+                            sharedEventID STRING,
+                            vpcEndpointId STRING,
+                            tlsDetails STRUCT<
+                                tlsVersion: STRING,
+                                cipherSuite: STRING,
+                                clientProvidedHostHeader: STRING>
+                        )
+                        COMMENT 'CloudTrail Organizational table for aws-controltower-logs-{account_id} bucket'
+                        PARTITIONED BY (region STRING, date STRING)
+                        ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'
+                        STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+                        OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+                        LOCATION 's3://{bucket_name}/{prefix}{account_id}/CloudTrail/'
+                        TBLPROPERTIES (
+                        'projection.enabled'='true',
+                        'projection.region.type'='enum',
+                        'projection.region.values'='us-east-2,us-east-1,us-west-1,us-west-2,af-south-1,ap-east-1,ap-south-1,ap-northeast-3,ap-northeast-2,ap-southeast-1,ap-southeast-2,ap-northeast-1,ca-central-1,eu-central-1,eu-west-1,eu-west-2,eu-south-1,eu-west-3,eu-north-1,me-south-1,sa-east-1',
+                        'projection.date.format'='yyyy/MM/dd',
+                        'projection.date.interval'='1',
+                        'projection.date.interval.unit'='DAYS',
+                        'projection.date.range'='2015/01/01,NOW',
+                        'projection.date.type'='date',
+                        'storage.location.template'='s3://{bucket_name}/{prefix}{account_id}/CloudTrail/${region}/${date}');
+                        """
+
+                  # Start the Athena query
+                  response = athena_client.start_query_execution(
+                      QueryString=str(query_string),
+                      QueryExecutionContext={
+                          'Database': database
+                      },
+                      ResultConfiguration={
+                          'OutputLocation': f"s3://{athena_results_bucket_name}/"
+                      }
+                  )
+
+                  # Get the query execution ID
+                  print(f"Query {response} Executed to add table for {account_id}. Review your Athena Logs for status")
+
+
+  FunctionAllAccounts:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaTriggerRule
+    Properties:
+      FunctionName: CloudTrailLogsPartitionedAllAccounts
+      Runtime: python3.9
+      Role: !GetAtt LambdaRoleAllAccounts.Arn
+      Handler: index.lambda_handler
+      Timeout: 420 # 7 minutes
+      MemorySize: 3008 # High memory allocation
+      LoggingConfig:
+        LogGroup: !Ref AllAccountsLambdaLogGroup
+      Environment:
+        Variables:
+          BucketName: !Ref BucketName
+          AthenaResultsBucketName: !Ref AthenaResultsBucketName
+          AthenaDatabase: !Ref CloudTrailGlueDatabase
+          Prefix: !Ref Prefix
+          DataCatalog: !Ref AWS::AccountId
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import re
+          from botocore.exceptions import ClientError
+
+
+          # Create a boto3 session
+          session = boto3.Session()
+
+          # Get the current region from the session
+          current_region = session.region_name
+
+          # Create an S3 client
+          s3 = boto3.client('s3')
+          athena_client = boto3.client('athena', region_name=current_region)
+          glue_client = boto3.client('glue')
+
+          # Validation patterns
+          BUCKET_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+          PREFIX_PATTERN = re.compile(r'^[\w\-\./]+$')
+          DATABASE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+          def validate_input(input_str: str, pattern: re.Pattern, max_length: int = 255) -> bool:
+              """Validate input string against pattern and length."""
+              if not isinstance(input_str, str):
+                  return False
+              if len(input_str) > max_length:
+                  return False
+              return bool(pattern.match(input_str))
+
+
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = os.environ['BucketName']
+                  athena_results_bucket_name = os.environ['AthenaResultsBucketName']
+                  database = os.environ['AthenaDatabase']
+                  prefix = os.environ['Prefix'].lstrip('/')
+                  data_catalog = os.environ['DataCatalog']
+
+                  # Validate inputs
+                  if not all([
+                      validate_input(bucket_name, BUCKET_NAME_PATTERN),
+                      validate_input(athena_results_bucket_name, BUCKET_NAME_PATTERN),
+                      validate_input(database, DATABASE_NAME_PATTERN),
+                      validate_input(prefix, PREFIX_PATTERN)
+                  ]):
+                      raise ValueError("Invalid input parameters")
+
+                  accounts_id = getting_accounts(bucket_name, prefix)
+
+                  # Check if all accounts table exists. If it does update the projection. If it doesn't, create it.
+                  try:
+                      # Check if table exists by attempting to get its metadata
+                      response = glue_client.get_table(
+                          DatabaseName=database,
+                          CatalogId=data_catalog,
+                          Name='all_accounts_trail'
+                      )
+
+                      if response:
+                          update_table(database, athena_results_bucket_name, accounts_id)
+
+                  except ClientError as e:
+                      if e.response['Error']['Code'] == 'EntityNotFoundException':
+                          print(f"Table all_accounts_trail does not exist in database {database}")
+                          run_athena(accounts_id, bucket_name, prefix, athena_results_bucket_name, database)
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  raise
+
+
+          def update_table(database, athena_results_bucket_name, accounts_id):
+              query = f"""
+                        ALTER TABLE all_accounts_trail SET TBLPROPERTIES ('projection.account.values'={accounts_id})"""
+              response = athena_client.start_query_execution(
+                  QueryString=str(query),
+                  QueryExecutionContext={
+                      'Database': database
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': f"s3://{athena_results_bucket_name}/"
+                  }
+              )
+
+              print(f"Query {response} was executed. Table all_accounts_trail was updated. Review your Athena Tables for status")
+
+
+          def run_athena(accounts_id, bucket_name, prefix, athena_results_bucket_name, database):
+              region = '''{region}'''
+              date = '''{date}'''
+              account = '''{account}'''
+              query_string = f"""
+                        CREATE EXTERNAL TABLE all_accounts_trail (
+                            eventVersion STRING,
+                            userIdentity STRUCT<
+                                type: STRING,
+                                principalId: STRING,
+                                arn: STRING,
+                                accountId: STRING,
+                                invokedBy: STRING,
+                                accessKeyId: STRING,
+                                userName: STRING,
+                                sessionContext: STRUCT<
+                                    attributes: STRUCT<
+                                        mfaAuthenticated: STRING,
+                                        creationDate: STRING>,
+                                    sessionIssuer: STRUCT<
+                                        type: STRING,
+                                        principalId: STRING,
+                                        arn: STRING,
+                                        accountId: STRING,
+                                        username: STRING>,
+                                    ec2RoleDelivery: STRING,
+                                    webIdFederationData: MAP<STRING,STRING>>>,
+                            eventTime STRING,
+                            eventSource STRING,
+                            eventName STRING,
+                            awsRegion STRING,
+                            sourceIpAddress STRING,
+                            userAgent STRING,
+                            errorCode STRING,
+                            errorMessage STRING,
+                            requestParameters STRING,
+                            responseElements STRING,
+                            additionalEventData STRING,
+                            requestId STRING,
+                            eventId STRING,
+                            resources ARRAY<STRUCT<
+                                arn: STRING,
+                                accountId: STRING,
+                                type: STRING>>,
+                            eventType STRING,
+                            apiVersion STRING,
+                            readOnly STRING,
+                            recipientAccountId STRING,
+                            serviceEventDetails STRING,
+                            sharedEventID STRING,
+                            vpcEndpointId STRING,
+                            tlsDetails STRUCT<
+                                tlsVersion: STRING,
+                                cipherSuite: STRING,
+                                clientProvidedHostHeader: STRING>
+                        )
+                        COMMENT 'CloudTrail Organizational All Accounts'
+                            PARTITIONED BY (`account` string, region STRING, date STRING)
+                        ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe'
+                        STORED AS INPUTFORMAT 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+                        OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+                        LOCATION 's3://{bucket_name}/{prefix}'
+                        TBLPROPERTIES (
+                        'projection.enabled'='true',
+                        'projection.account.type'='enum',
+                        'projection.account.values'={accounts_id},
+                        'projection.region.type'='enum',
+                        'projection.region.values'='us-east-2,us-east-1,us-west-1,us-west-2,af-south-1,ap-east-1,ap-south-1,ap-northeast-3,ap-northeast-2,ap-southeast-1,ap-southeast-2,ap-northeast-1,ca-central-1,eu-central-1,eu-west-1,eu-west-2,eu-south-1,eu-west-3,eu-north-1,me-south-1,sa-east-1',
+                        'projection.date.format'='yyyy/MM/dd', 
+                        'projection.date.interval'='1', 
+                        'projection.date.interval.unit'='DAYS', 
+                        'projection.date.range'='2015/01/01,NOW', 
+                        'projection.date.type'='date', 
+                        'storage.location.template'='s3://{bucket_name}/{prefix}${account}/CloudTrail/${region}/${date}')
+                        """
+
+              # Start the Athena query
+              response = athena_client.start_query_execution(
+                  QueryString=str(query_string),
+                  QueryExecutionContext={
+                      'Database': database
+                  },
+                  ResultConfiguration={
+                      'OutputLocation': f"s3://{athena_results_bucket_name}/"
+                  }
+              )
+
+              print(f"Query {response} was executed. Table all_accounts_trail was created. Review your Athena Tables for status")
+
+
+          def getting_accounts(bucket_name, prefix):
+              # List objects in the bucket with the given prefix
+              response_accounts = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter='/')
+              # Extract account IDs from the object keys
+              account_ids = set()
+              for obj in response_accounts.get('CommonPrefixes', []):
+                  match = re.match(r'^{}(\d+)/'.format(prefix), obj['Prefix'])
+                  if match:
+                      account_ids.add(match.group(1))
+
+              # Join the account IDs into a comma-separated string
+              account_ids_str = ','.join(account_ids)
+
+              # Save the account IDs string in a variable
+              account_values = str("'" + account_ids_str + "'")
+
+              return account_values
+
+
+
+
+  PermissionForEventsToInvokeLambdaAllFunctions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FunctionAllAccounts
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - LambdaTriggerRule
+          - Arn
+    
+  PermissionForEventsToInvokeLambdaPartitionedByAccount:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionPartitionByAccount
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - LambdaTriggerRule
+          - Arn
+  
+  DailyLambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: DailyLambdaTrigger1AMEST
+      Description: "Triggers Lambda functions daily at 1 AM EST"
+      ScheduleExpression: "cron(0 6 * * ? *)"
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt LambdaFunctionPartitionByAccount.Arn
+        Id: CloudTrailLogsPartitionedByAccountLambdaFunctionId
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 60
+          MaximumRetryAttempts: 2
+      - Arn: !GetAtt FunctionAllAccounts.Arn
+        Id: CloudTrailLogsPartitionedAllAccountsLambdaFunctionId
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 60
+          MaximumRetryAttempts: 2
+
+
+  LambdaInvokePermissionDaily1:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionPartitionByAccount
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyLambdaTriggerRule.Arn
+
+  LambdaInvokePermissionDaily2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FunctionAllAccounts
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyLambdaTriggerRule.Arn
+
+  InvestigateIdentityActions:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get a list of users who made a specific API call during the specified timeframe. In this example CreateBucket is used but you can replace it with another API.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT useridentity.arn AS user, \n"
+            - "eventsource, \n"
+            - "eventname \n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE useridentity.arn IS NOT NULL \n"
+            - "AND eventName = 'CreateBucket' \n"
+            - "AND date >= '2024/09/28' AND date <= '2024/09/30'\n"
+      Name: Investigate who called an API
+
+  InvestigateUserActions:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get all actions for a specific user.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT eventID, eventName, eventSource, eventTime, userIdentity.arn AS user\n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE userIdentity.arn LIKE '%<username>%'\n"
+            - "AND date >= '2024/09/28'\n"
+            - "AND date <= '2024/09/30'\n"
+      Name: Investigate user actions
+
+  ConsoleUsers:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get a list of users with a count of how many AWS console logins they had over a specified timeframe.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT userIdentity.arn, \n"
+            - "COUNT(*) AS loginCount \n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE eventName = 'ConsoleLogin' \n"
+            - "AND date >= '2024/09/28' \n"
+            - "AND date <= '2024/09/30' \n"
+            - "GROUP BY userIdentity.arn ORDER BY count(*) DESC\n"
+      Name: Find most frequent console users
+
+  IAMRolesAssumed:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get AWS service usage by IAM user/role.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT eventSource, \n"
+            - "array_agg(distinct userIdentity.arn) as AssumedRoles \n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE userIdentity.arn IS NOT NULL \n"
+            - "AND date >= '2024/09/28' \n"
+            - "AND date <= '2024/09/30' \n"
+            - "GROUP BY eventSource\n"
+      Name: List IAM roles assumed to access services
+
+  UsedIAMRoles:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get IAM roles in specified timeframe ordered from least recently used to most recently used. This is useful to find unused roles.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT COALESCE(\n"
+            - "json_extract_scalar(requestparameters, '$.roleArn'), \n"
+            - "json_extract_scalar(requestparameters, '$.roleName')\n"
+            - ") AS roleName, \n"
+            - "MAX(eventTime) AS lastUsage \n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE eventSource IN ('sts.amazonaws.com', 'iam.amazonaws.com') \n"
+            - "AND date >= '2024/09/28' \n"
+            - "AND date <= '2024/09/30' \n"
+            - "GROUP BY COALESCE(\n"
+            - "json_extract_scalar(requestparameters, '$.roleArn'), \n"
+            - "json_extract_scalar(requestparameters, '$.roleName')\n"
+            - ") \n"
+            - "ORDER BY lastUsage ASC;\n"
+      Name: Get least recently used IAM roles
+
+  AssumedIAMRoles:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: Get assumed IAM roles in specified timeframe sorted from most frequently assumed to least frequently assumed.
+      QueryString:
+        Fn::Join:
+          - ""
+          - - "SELECT \n"
+            - "json_extract_scalar(requestparameters, '$.roleArn') AS roleArn, \n"
+            - "count(*) as timesAssumed \n"
+            - "FROM \""
+            - !Ref AthenaDatabase
+            - "\".\"all_accounts_trail\" \n"
+            - "WHERE eventSource = 'sts.amazonaws.com' \n"
+            - "AND eventName = 'AssumeRole' \n"
+            - "AND date >= '2024/09/28' AND date <= '2024/09/30' \n"
+            - "GROUP BY json_extract_scalar(requestparameters, '$.roleArn') \n"
+            - "ORDER BY timesAssumed DESC\n"
+      Name: Get the most frequently assumed IAM roles
